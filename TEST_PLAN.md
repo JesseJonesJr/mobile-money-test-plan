@@ -1130,6 +1130,281 @@ KYC tier transaction limits, AML alert triggers, sanctions screening, transactio
 
 **Notes:** Fee transparency is both a regulatory requirement and a consumer trust issue. Users should never see a fee they did not see before confirming. Money math must use fixed-point or decimal arithmetic, not floating point: a fee of GHS 0.50 represented as a float can produce rounding errors that accumulate into ledger drift over millions of transactions. The cleanest implementation stores all amounts as integer minor units (pesewas in Ghana) and only converts to decimal for display.
 
+## Flow 5: Money Out
+
+12 test cases covering cash-out via agent, wallet-to-bank withdrawals, agent e-money float ceilings, per-tier daily cash-out limits, agent commission calculation and end-of-day settlement, idempotent retries, fraud-pattern holds, reversal handling, and multi-party reconciliation.
+
+### TC-COUT-001: User cashes out via agent successfully
+
+**Category:** Functional
+**Severity:** Critical
+
+**Preconditions:**
+
+- User: Standard tier, wallet balance GHS 1,000
+- Agent: e-money float at GHS 1,000 (capacity to accept up to the regulatory ceiling of GHS 10,000), commission wallet GHS 50, status active
+- Cash-out fee for the GHS 500 band: GHS 5 total (GHS 2 agent commission, GHS 3 platform fee)
+- Agent and user are physically present at the agent's location
+
+**Steps:**
+
+1. User tells agent they want to withdraw GHS 500
+2. Agent opens the agent app, selects "Withdraw"
+3. Agent enters user phone `+233 24 555 1234` and amount GHS 500
+4. Agent presses Confirm
+5. User's phone receives push notification or USSD prompt: "Confirm withdrawal of GHS 500 at Agent KOJO ENT. Fee: GHS 5. Enter PIN to approve."
+6. User enters PIN on their own device to authorize
+7. Agent counts and hands the user GHS 500 in physical cash
+
+**Expected Result:** Transaction completes within 5 seconds of user PIN entry. Final state:
+
+- User wallet: GHS 1,000 becomes GHS 495 (debited GHS 500 principal plus GHS 5 fee)
+- Agent e-money float: GHS 1,000 becomes GHS 1,500 (received GHS 500 equivalent of cash disbursed)
+- Agent commission wallet: GHS 50 becomes GHS 52 (accrued GHS 2 commission)
+- Platform fee revenue account: increases by GHS 3
+
+Money is conserved end-to-end: wallet debit GHS 505 equals agent float credit GHS 500 plus commission GHS 2 plus platform fee GHS 3. Both user and agent receive SMS confirmation with the transaction reference and full receipt details.
+
+### TC-COUT-002: Cash-out is rejected when balance is below requested amount plus fee
+
+**Category:** Money Math + Negative
+**Severity:** Critical
+
+**Preconditions:**
+
+- User balance: GHS 200
+- User attempts cash-out of GHS 200 (fee on GHS 200 amount band = GHS 2, so total required = GHS 202)
+
+**Steps:**
+
+1. Agent submits withdrawal of GHS 200 for the user
+2. User enters PIN to authorize
+
+**Expected Result:** Transaction is rejected with the message "Insufficient balance. You need GHS 202 (GHS 200 plus GHS 2 fee) but have GHS 200." User can reduce the requested amount or cancel. User wallet unchanged. Agent float unchanged. No partial transaction recorded.
+
+**Notes:** This case catches a subtle bug: a system that compares balance only against the principal (200 ≥ 200, OK) but then debits principal plus fee (202) drives the balance negative. The check must compare balance to the FULL deduction including all fees.
+
+### TC-COUT-003: Cash-out is blocked when agent's e-money float would exceed the regulatory ceiling
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- Agent e-money float regulatory ceiling: GHS 10,000
+- Agent current e-money float: GHS 9,800
+- User requests withdrawal of GHS 500 (would push agent float to GHS 10,300, above ceiling)
+
+**Steps:**
+
+1. Agent submits the withdrawal request
+2. System checks agent capacity before proceeding to user PIN prompt
+
+**Expected Result:** Transaction is rejected at the agent side before reaching the user with the message "You cannot accept this transaction. Your float is near its limit. Please cash out at a super-agent first." User receives SMS: "Your withdrawal at this agent could not be processed. Please try another agent." User wallet unchanged. The block applies only to this transaction; the agent's account is not locked.
+
+**Notes:** Agent e-money float ceilings are a prudential regulatory control. Mobile money operators are required to maintain trust account balances at the central bank equal to all outstanding e-money. Capping individual agent floats limits operational risk if an agent's account is compromised. When an agent hits the ceiling, they must "cash out" their float at a super-agent or bank, converting e-money back to cash, before they can accept more customer withdrawals.
+
+### TC-COUT-004: PIN is required for every cash-out, with no remember-me option
+
+**Category:** Security
+**Severity:** Critical
+
+**Preconditions:**
+
+- User has an active session and just completed a different cash-out 1 minute ago
+
+**Steps:**
+
+1. Agent initiates another cash-out for the same user
+2. User reaches the PIN entry step
+
+**Expected Result:** PIN entry is required on every cash-out regardless of session age or recent cash-out activity. There is no "trust this agent for the next N minutes" option. After 3 incorrect PIN entries on a single cash-out, the cash-out is cancelled. Failed attempts count toward the global lockout threshold from TC-AUTH-003.
+
+**Notes:** Cash-out is irreversible the moment the agent disburses physical cash. Skipping PIN even within a recent session would let anyone with brief access to an unlocked phone authorize a cash-out at a colluding agent. Per-transaction PIN is non-negotiable for any withdrawal flow.
+
+### TC-COUT-005: Daily cash-out limit per tier is enforced atomically
+
+**Category:** Compliance + Concurrency
+**Severity:** Critical
+
+**Preconditions:**
+
+- Basic tier user, daily cash-out limit GHS 3,000 (independent from transfer limits)
+- User has already cashed out GHS 2,800 today across two earlier transactions
+- User attempts a new cash-out of GHS 400 (would push daily total to GHS 3,200, over limit)
+
+**Steps:**
+
+1. Agent initiates the cash-out of GHS 400
+2. System aggregates today's cash-outs and checks against the limit
+
+**Expected Result:** Cash-out is rejected with the message "This withdrawal would exceed your daily cash-out limit. You can withdraw up to GHS 200 more today." User can request a smaller withdrawal (up to GHS 200) or wait until midnight reset. The aggregation is atomic across concurrent requests: two simultaneous cash-out attempts at different agents cannot both succeed if their sum would exceed the daily limit.
+
+**Notes:** Daily cash-out limits are typically lower than transfer limits because cash leaves the platform's view the moment it is disbursed. The atomic aggregation must work even across different agents the user might visit in quick succession, which means the limit check needs a shared state lock or a transactional aggregate query.
+
+### TC-COUT-006: Wallet-to-bank withdrawal succeeds for a linked bank account
+
+**Category:** Integration
+**Severity:** High
+
+**Preconditions:**
+
+- User has linked a bank account with valid Open Banking authorization (token not expired)
+- User wallet balance: GHS 1,500
+- Wallet-to-bank fee for the GHS 1,000 band: GHS 8
+
+**Steps:**
+
+1. User selects "Withdraw to bank"
+2. Selects the linked bank account
+3. Enters amount GHS 1,000
+4. Confirms with PIN
+
+**Expected Result:** Wallet debits GHS 1,008 (GHS 1,000 plus GHS 8 fee). Platform initiates a credit transfer to the user's bank account via the relevant rail (e.g. GhIPSS Instant Pay in Ghana). Bank credits the GHS 1,000 to the user's bank account. Settlement is typically within minutes for instant rails, or up to next business day for slower rails. User receives SMS at each settlement step: wallet debit, transfer initiated, bank credit confirmed.
+
+**Notes:** Wallet-to-bank withdrawals are an alternative to agent cash-out, popular with users who prefer keeping money in a bank account rather than physical cash. They have different settlement characteristics than agent cash-out (typically slower) and different fee economics (often more expensive for the platform because the bank rail charges interchange or per-transaction fees).
+
+### TC-COUT-007: Agent commission is calculated correctly per the published commission schedule
+
+**Category:** Money Math
+**Severity:** High
+
+**Preconditions:**
+
+- Agent commission schedule for cash-out (example, share of customer fee):
+  - GHS 1 to GHS 100: 40% of customer fee
+  - GHS 101 to GHS 500: 35% of customer fee
+  - GHS 501 to GHS 2,000: 30% of customer fee
+  - GHS 2,001 and above: 25% of customer fee
+- Customer fee schedule for cash-out is already configured
+
+**Steps:**
+
+1. Process cash-out of GHS 75 (customer fee GHS 1.50, expected agent commission GHS 0.60)
+2. Process cash-out of GHS 250 (customer fee GHS 3.00, expected agent commission GHS 1.05)
+3. Process cash-out of GHS 1,000 (customer fee GHS 10.00, expected agent commission GHS 3.00)
+4. Process cash-out of GHS 3,000 (customer fee GHS 25.00, expected agent commission GHS 6.25)
+
+**Expected Result:** For each transaction, the commission accrued to the agent matches the schedule exactly. Commission is stored in integer minor units (pesewas), not as a floating point percentage of the fee, to avoid rounding drift. The agent's commission ledger records each accrual with: transaction reference, customer fee paid, commission rate applied, commission amount in minor units, and timestamp.
+
+**Notes:** Agent commission accounting is the single most operationally complex part of a mobile money system. Agents are independent contractors whose income depends on accurate, transparent commission calculation. Small rounding errors at scale (millions of transactions per day) compound into disputes that damage the agent network. The standard pattern: define commission rates as integer numerator over integer denominator (e.g. 40/100), apply to the fee in minor units, and use banker's rounding (round half-to-even) at the final step to avoid systematic over-rounding in either direction.
+
+### TC-COUT-008: Agent commission settles to the commission wallet at end-of-day
+
+**Category:** Money Math + Functional
+**Severity:** High
+
+**Preconditions:**
+
+- Agent has accrued GHS 47.25 in commission across 23 transactions over the course of a day
+- Commission settlement policy: daily, at 23:59 local time, into the agent's commission wallet (separate from the e-money float)
+
+**Steps:**
+
+1. Wait for the end-of-day settlement job to run
+2. Inspect the agent's commission wallet, accrual ledger, and settlement ledger
+
+**Expected Result:** At end-of-day, the GHS 47.25 in accrued commission moves from the "Accrued" state into the agent's commission wallet (becoming spendable or withdrawable). The agent's commission ledger shows: 23 individual accruals during the day, one settlement entry of GHS 47.25, and a balance carried forward of GHS 0.00 in the accrual bucket until the next transaction accrues. The settlement job is idempotent: if it runs twice for the same day (e.g. due to a retry after transient failure), funds settle exactly once.
+
+**Notes:** Daily settlement balances cash flow for agents (small-business agents depend on daily income) with operational efficiency for the platform (batch settle is cheaper than per-transaction settle). Some platforms settle hourly, some weekly. Whatever the cadence, accrual and settlement must be tested separately, and the settlement job must be idempotent because batch jobs commonly retry on transient infrastructure failures.
+
+### TC-COUT-009: Idempotent retry on cash-out does not double-debit the user
+
+**Category:** Money Math + Concurrency
+**Severity:** Critical
+
+**Preconditions:**
+
+- Agent submits a GHS 500 cash-out with idempotency key `idem-cout-001`
+- Server processes successfully but the response is lost due to network failure
+- Agent client retries with the same idempotency key
+
+**Steps:**
+
+1. Original cash-out succeeds server-side: user debited GHS 505, agent float credited GHS 500, commission accrued GHS 2
+2. HTTP response is lost in transit (server-side success, client-side timeout)
+3. Agent client automatically retries with key `idem-cout-001`
+4. Server receives the retry
+
+**Expected Result:** Server recognizes the idempotency key as already processed and returns the cached original response without re-executing the transaction. User balance, agent float, and commission ledger are all unchanged from the first execution. The original transaction reference appears exactly once in the audit log. The agent disburses physical cash once, not twice.
+
+**Notes:** This is the cash-out mirror of TC-CIN-007. Both directions need idempotency, but cash-out is arguably more user-visible because the agent has already disbursed physical cash by the time the retry happens. Without idempotency, the user gets debited twice for one cash payment, which is the kind of failure that triggers the loudest support tickets.
+
+### TC-COUT-010: Suspicious cash-out pattern triggers a fraud review hold
+
+**Category:** Security + Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- User has been withdrawing larger amounts at different agents over the past hour:
+  - 14:00: GHS 800 at Agent A
+  - 14:20: GHS 1,500 at Agent B
+  - 14:40: GHS 2,000 at Agent C
+- Fraud rules engine threshold: more than GHS 4,000 in cash-outs across 3 or more agents within 1 hour triggers a review hold
+
+**Steps:**
+
+1. User attempts to cash out GHS 1,000 at a 4th agent (Agent D)
+
+**Expected Result:** Transaction is held in a "Pending fraud review" state. User receives SMS: "For your security, we are reviewing this withdrawal. You will hear from us within 30 minutes. Reference: TXN-XYZ." Agent receives a notification to wait or refer the user to support. The fraud team can approve (release) or block (cancel and refund the held amount) within the SLA. No physical cash is disbursed until the hold clears.
+
+**Notes:** Rapid cash-outs across multiple agents are a classic account-takeover pattern: an attacker who has gained access drains the wallet through a series of withdrawals at different agents to stay under per-transaction or per-agent limits. Holding the 4th transaction for review costs the user a few minutes if legitimate but can save thousands in stolen funds if not. Production fraud rules are far more sophisticated (behavioral baselines, device-and-location risk scores, peer comparison) but a clear rule like this is sufficient as a baseline test.
+
+### TC-COUT-011: Cash-out reversal requires user consent AND support authorization
+
+**Category:** Security
+**Severity:** High
+
+**Preconditions:**
+
+- A cash-out of GHS 500 was processed 10 minutes ago
+- Agent claims they over-disbursed (handed the user GHS 600 instead of GHS 500) and wants to reverse and re-process
+
+**Steps:**
+
+1. Agent contacts support to report the over-disbursement
+2. Support opens a reversal ticket and contacts the user
+3. User confirms (via SMS reply or in-app prompt) that they received GHS 600 instead of GHS 500
+4. Support initiates the reversal of the original cash-out
+5. Support then processes a corrected cash-out of GHS 600
+
+**Expected Result:** Cash-out reversal does NOT auto-execute from the agent app. BOTH user consent AND support authorization are required before any state changes. Once both are present, the original transaction is reversed (user wallet returned to pre-transaction state, agent float and commission also reversed). The corrected cash-out is processed as a fresh transaction. If the user denies the over-disbursement, the reversal does not proceed; the agent must pursue recovery offline (e.g. calling the user back) and absorbs the loss if recovery fails.
+
+**Notes:** Unlike cash-in reversals (TC-CIN-009 and TC-CIN-010), cash-out reversal is operationally much harder because the physical cash has already left the agent's till. The reversal mechanism only corrects the electronic ledger to match what happened physically. Without user consent, a dishonest agent could falsely claim over-disbursement and reverse cash-outs that were correctly processed, effectively stealing back the e-money equivalent of cash they genuinely owed.
+
+### TC-COUT-012: Cash-out record is consistent and reconcilable across user, agent, and audit views
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- A successful cash-out has just completed
+
+**Steps:**
+
+1. View the transaction in the user's transaction history
+2. View the corresponding entry in the agent's transaction history
+3. Inspect the back-end audit record
+
+**Expected Result:** All three views show consistent details for the same transaction ID:
+
+- Transaction ID (identical across all three views)
+- Type: Cash-out
+- Principal amount, customer fee, total debited from user
+- Agent commission amount (visible in agent view and audit view, not in user view)
+- Platform fee amount (visible in audit view only)
+- Agent ID, name, and location
+- User phone (masked in agent view, full in audit view)
+- Timestamps in both UTC and local time
+- Status: Completed
+- Cryptographic hash linking this transaction to the previous one in the respective ledger (user, agent, and audit ledgers each chain independently)
+
+The user view shows what the user paid. The agent view shows what they earned. The audit view shows the full money flow including platform fee. This separation respects privacy and operational need-to-know while remaining fully reconcilable across all parties.
+
+**Notes:** Multi-party reconciliation is essential. The user, agent, platform, and regulator each need a consistent view of the transaction at their appropriate level of detail. The cleanest implementation uses a single source of truth (the audit ledger) with role-based views derived from it. This avoids drift where "the agent's view shows GHS 2.00 commission but the audit shows GHS 2.05" can destroy trust at the agent network level. End-of-day reconciliation should cross-check that the sum of all user debits equals the sum of all agent float credits plus all commission accruals plus all platform fees, on every settlement run.
+
 ## References
 
 This plan is informed by, but not formally compliant with, the following frameworks. Mentioned to make the regulatory awareness explicit:
@@ -1142,4 +1417,4 @@ This plan is informed by, but not formally compliant with, the following framewo
 
 ---
 
-*Test cases for Flows 5 through 7 are pending and will be added incrementally.*
+*Test cases for Flows 6 and 7 are pending and will be added incrementally.*
