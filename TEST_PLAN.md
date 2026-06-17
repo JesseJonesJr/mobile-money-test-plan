@@ -881,6 +881,255 @@ KYC tier transaction limits, AML alert triggers, sanctions screening, transactio
 
 **Notes:** Immutability is required by AML regulations and is essential for dispute resolution. Many jurisdictions require transaction records to be retained for 5 to 7 years. Hash-chained or append-only logs (similar in concept to blockchain or write-once storage) make tampering detectable even by privileged insiders.
 
+## Flow 4: Money Movement
+
+12 test cases covering on-network P2P transfers, off-network interoperability transfers, send-to-non-user with escrow and expiration-return, bill payments with biller-failure refund, merchant payments, recipient name verification, duplicate transfer detection, and tier-based fee calculation.
+
+### TC-MOV-001: P2P transfer to another user on the same network completes successfully
+
+**Category:** Functional
+**Severity:** Critical
+
+**Preconditions:**
+
+- Sender: Standard tier, balance GHS 1,000, daily limit GHS 10,000 (untouched today)
+- Recipient: Standard tier, balance GHS 200, account active and not blocked
+- Both users on the same mobile money network
+
+**Steps:**
+
+1. Sender opens "Send Money"
+2. Enters recipient phone number `+233 24 555 7777`
+3. System displays the recipient's masked name as registered (e.g. "Kojo A.")
+4. Sender confirms recipient and enters amount GHS 300
+5. System displays a transaction summary including the applicable fee
+6. Sender enters PIN to confirm
+
+**Expected Result:** Transfer completes within 3 seconds. Sender balance decreases by GHS 300 plus the fee. Recipient balance increases by GHS 300 (recipient does not pay receive fees on-network). Both receive SMS confirmation. A transaction reference is generated and recorded in both transaction histories.
+
+### TC-MOV-002: P2P transfer fails cleanly when sender has insufficient balance
+
+**Category:** Money Math + Negative
+**Severity:** Critical
+
+**Preconditions:**
+
+- Sender balance: GHS 100
+- Sender attempts to send GHS 300 plus fee
+
+**Steps:**
+
+1. Initiate send of GHS 300 to a valid recipient
+2. Confirm with PIN
+
+**Expected Result:** Transfer is rejected with the message "Insufficient balance. You have GHS 100 available." Sender balance remains GHS 100. No funds are deducted, not even partially. Recipient balance is unchanged and no notification is sent. Transaction is logged as "Failed: insufficient balance" in the sender's transaction history with no impact on daily limit counters.
+
+**Notes:** Partial debits on failed transfers are one of the most common money-math bugs in poorly-engineered wallets. The balance check must happen BEFORE any state mutation, and ideally inside the same atomic database transaction that performs the debit.
+
+### TC-MOV-003: P2P transfer requires fresh PIN entry, even within an active session
+
+**Category:** Security
+**Severity:** High
+
+**Preconditions:**
+
+- User is logged in with an active PIN-based session
+- User completed a transfer 1 minute ago
+
+**Steps:**
+
+1. Initiate a new transfer to a different recipient
+2. Confirm recipient and amount
+3. Reach the PIN entry screen
+
+**Expected Result:** PIN entry is required for every transfer, regardless of session age or recent transactions. There is no "remember PIN for this session" option. After PIN entry, transfer proceeds. After 3 incorrect PIN entries on a single transfer, the transfer is cancelled and the user is returned to the home screen (without locking the entire account, unless the global lockout counter reaches its threshold per TC-AUTH-003).
+
+**Notes:** Per-transaction PIN entry is the floor of mobile money security. The PIN is the "what you know" factor that, combined with possession of the SIM, provides two-factor authentication for each transfer. Skipping PIN even once breaks this guarantee.
+
+### TC-MOV-004: Recipient name is displayed before confirmation to prevent typo errors
+
+**Category:** Functional
+**Severity:** High
+
+**Preconditions:**
+
+- Recipient `+233 24 555 7777` is registered as "Kojo Asante"
+- Sender enters `+233 24 555 7778` (off by one digit), which is registered as "Ama Mensah"
+
+**Steps:**
+
+1. Sender enters phone number `+233 24 555 7778`
+2. System looks up the recipient
+
+**Expected Result:** System displays the recipient's masked name (e.g. "Ama M." or "A** M*****") before allowing sender to proceed. The sender can clearly see this is NOT the intended recipient and can cancel or correct the number. The mask balances privacy (avoid revealing full PII to anyone with a phone number) with verification (sender can confirm the right person).
+
+**Notes:** Sending to the wrong number is the single most common mobile money user error. Recipient name display is a UX-level fraud and error prevention control. The mask format varies: some platforms show first name and last initial, others mask everything but a few characters. The mask must be informative enough to verify and opaque enough to prevent name enumeration attacks.
+
+### TC-MOV-005: Off-network transfer to a user on a different mobile money network
+
+**Category:** Integration
+**Severity:** High
+
+**Preconditions:**
+
+- Sender on platform A (this platform)
+- Recipient on platform B (different operator), recipient phone is registered and active
+- Cross-network interoperability is enabled (in Ghana, via GhIPSS Mobile Money Interoperability switch)
+
+**Steps:**
+
+1. Sender initiates send to recipient on platform B
+2. System detects the recipient is off-network and displays the cross-network fee (typically higher than on-network)
+3. Sender confirms with PIN
+
+**Expected Result:** Transfer routes through the interoperability switch. Sender wallet debits the amount plus the cross-network fee. Recipient receives the amount in their platform B wallet, typically within 30 seconds. Both sender and recipient receive SMS confirmation. The transaction is logged with the cross-network indicator and the interoperability switch reference number.
+
+**Notes:** Cross-network transfers depend on the interoperability switch (GhIPSS MMI in Ghana, similar systems in other markets). The switch may be slower than on-network transfers (30 seconds to several minutes versus sub-second). Tests should verify behavior at the boundary, including timeout handling if the switch is slow to respond and split-brain handling if the switch cannot confirm delivery.
+
+### TC-MOV-006: Send-to-non-user creates an escrow with a redemption code
+
+**Category:** Functional + Edge
+**Severity:** High
+
+**Preconditions:**
+
+- Sender balance: GHS 1,000
+- Recipient phone number `+233 24 999 0001` is NOT registered with any mobile money platform
+
+**Steps:**
+
+1. Sender enters recipient phone `+233 24 999 0001`
+2. System recognizes the number is not registered and offers "Send to non-user"
+3. Sender confirms intent, enters amount GHS 500, and confirms with PIN
+
+**Expected Result:** Funds are debited from sender's wallet (GHS 500 plus applicable fee) and held in an escrow account, NOT credited to anyone yet. Recipient receives an SMS: "Kojo A. sent you GHS 500. Visit any Agent with your phone, ID, and this code: 8472-3691 to collect. Or download the app and register your number to receive directly. Code expires in 7 days." Sender receives confirmation: "GHS 500 held for recipient. They have 7 days to claim. If unclaimed, funds will return to your wallet." Both records reference the escrow ID.
+
+**Notes:** Send-to-non-user is one of mobile money's killer features for financial inclusion. It lets banked users transfer to unbanked recipients without requiring upfront registration. The escrow pattern is essential: money is debited from sender but not credited until recipient claims, so the platform tracks an in-flight liability rather than money that "exists" in any wallet. Without this, the platform either delays sender debit (sender doesn't know if the transfer succeeded) or credits nowhere (loses money). The 7-day window is industry standard, with codes typically 6 to 10 digits to balance memorability against guessing risk.
+
+### TC-MOV-007: Unclaimed send-to-non-user funds return to sender after expiration
+
+**Category:** Money Math + Functional
+**Severity:** Critical
+
+**Preconditions:**
+
+- An escrow transaction from TC-MOV-006 is 7 days and 1 minute old
+- Recipient never registered or visited an agent to claim
+- Sender balance is currently GHS 500 (originally GHS 1,000 before the held send, after fees)
+
+**Steps:**
+
+1. Background reconciliation job runs at its configured interval (e.g. hourly)
+
+**Expected Result:** The expired escrow is returned to the sender's wallet. Sender balance goes from GHS 500 back to GHS 1,000 (with the principal returned; fees may or may not be refunded depending on policy). Sender receives SMS: "The GHS 500 you sent to +233 24 999 0001 was not claimed. Funds have been returned to your wallet." The escrow record is marked "Returned to sender" with the return timestamp and reconciliation job ID. The redemption code is invalidated and cannot be used.
+
+**Notes:** Return-to-sender on expiration is critical for two reasons: the user trusts that unclaimed money is not lost forever, and the platform avoids accumulating untracked escrow liabilities on its books. Fee policy varies: some platforms refund fees on returns, others keep them as a processing cost. Either is defensible if disclosed clearly upfront. The reconciliation job must be idempotent: if it runs twice on the same expired escrow (e.g. due to job retry on transient failure), the funds are returned exactly once, not twice.
+
+### TC-MOV-008: Bill payment to a registered biller completes with reference number
+
+**Category:** Integration
+**Severity:** High
+
+**Preconditions:**
+
+- User has GHS 200 balance
+- Biller (e.g. ECG electricity) is integrated with the platform
+- User has the biller account number (e.g. meter number) ready
+
+**Steps:**
+
+1. Open "Pay Bills", select "Electricity", select "ECG"
+2. Enter meter number
+3. System fetches account details from the biller API (account holder name, current balance or amount due if applicable)
+4. User confirms the account
+5. Enter amount GHS 150
+6. Confirm with PIN
+
+**Expected Result:** Wallet debits GHS 150 plus any service fee. Biller API is called with the payment instruction. Biller returns a confirmation reference (e.g. ECG receipt number). User sees the success screen with: amount paid, biller reference, meter number, and timestamp. SMS confirmation is sent. Transaction is logged with both the platform reference and the biller reference for reconciliation.
+
+### TC-MOV-009: Failed bill payment auto-refunds the wallet within 60 seconds
+
+**Category:** Money Math + Negative
+**Severity:** Critical
+
+**Preconditions:**
+
+- User has GHS 200 balance
+- Bill payment to a biller is initiated; the biller API will return an error mid-transaction (test environment)
+
+**Steps:**
+
+1. Initiate bill payment of GHS 150
+2. PIN confirmation passes
+3. Wallet debit succeeds (GHS 200 becomes GHS 50)
+4. Biller API call fails with a clean error (e.g. "BILLER_TIMEOUT" or "ACCOUNT_NOT_FOUND")
+
+**Expected Result:** Within 60 seconds of biller failure, the platform auto-reverses the wallet debit. Balance returns from GHS 50 to GHS 200. User receives SMS: "Your bill payment of GHS 150 failed. Funds have been returned to your wallet." If the platform cannot determine within the timeout whether the biller succeeded or failed (network split-brain), the transaction is held in a "Pending reconciliation" state and a manual review is queued. Auto-refund only fires on a clean failure response.
+
+**Notes:** Bill payments are notorious for ambiguous failure modes. The biller may have received and processed the payment but failed to respond. Auto-refunding in that case would double-pay the bill (or worse, refund the user without the bill ever being paid, then the biller posts it later, creating a negative balance). The safest pattern is: clean error response triggers auto-refund; timeout or no response holds the funds in a reconciliation state until automated or manual reconciliation with the biller confirms which side has the money.
+
+### TC-MOV-010: Merchant payment via merchant code completes successfully
+
+**Category:** Functional
+**Severity:** High
+
+**Preconditions:**
+
+- Merchant is registered with the platform and has a merchant code (e.g. `MOMO-12345`) or QR code
+- User has sufficient balance
+
+**Steps:**
+
+1. Open "Pay Merchant", enter merchant code OR scan QR
+2. System displays the merchant name and category
+3. Enter amount (or amount is pre-filled if the QR is a static-amount code)
+4. Confirm with PIN
+
+**Expected Result:** Wallet debits the amount. Merchant wallet credits the amount minus the merchant processing fee (typically 0.5% to 1% in Ghana). User sees the success screen with merchant name, amount, and transaction reference. Both user and merchant receive SMS notifications. The transaction is logged with the merchant category code (MCC) for the merchant's reconciliation and for the platform's reporting.
+
+**Notes:** Merchant payments differ from P2P transfers in that the merchant pays the processing fee out of the received amount, similar to card payment processing. This fee structure is what makes mobile money economically sustainable for the platform. Merchants in Ghana generally accept this fee in exchange for the volume and convenience of mobile money over cash.
+
+### TC-MOV-011: Duplicate transfer within 30 seconds prompts confirmation
+
+**Category:** Security + Edge
+**Severity:** High
+
+**Preconditions:**
+
+- Sender just sent GHS 100 to `+233 24 555 7777` (recipient Kojo Asante) 20 seconds ago
+
+**Steps:**
+
+1. Sender initiates another send of GHS 100 to `+233 24 555 7777`
+2. Reaches the confirmation screen
+
+**Expected Result:** Before requesting PIN, the system displays a warning: "You sent GHS 100 to Kojo A. 20 seconds ago. Are you sure you want to send the same amount again?" with options "Yes, continue" and "No, cancel." Only if the user confirms does the transaction proceed to PIN entry. If the user cancels, no transaction is initiated. The detection window (30 seconds), the amount-and-recipient match criteria, and the warning text are configurable.
+
+**Notes:** Accidental double-sends are a frequent user complaint. They happen when the network is slow and the user assumes the first transaction did not go through, then retries manually. This warning costs one extra tap but prevents thousands of support tickets and accidental losses per day at scale. The warning should NOT block intentional duplicates (e.g. a user genuinely sending two GHS 100 transfers in a row), only flag them for explicit confirmation.
+
+### TC-MOV-012: Transfer fees are calculated correctly per tier and displayed before confirmation
+
+**Category:** Money Math
+**Severity:** High
+
+**Preconditions:**
+
+- Standard tier user
+- Fee schedule for Standard tier on-network transfers (example):
+  - GHS 1 to GHS 50: GHS 0.50
+  - GHS 51 to GHS 250: GHS 1.00
+  - GHS 251 to GHS 1,000: GHS 2.50
+  - GHS 1,001 and above: GHS 5.00
+
+**Steps:**
+
+1. User enters send amount GHS 100
+2. System displays the transaction summary
+
+**Expected Result:** Summary shows: amount GHS 100, fee GHS 1.00, total deducted GHS 101.00, recipient receives GHS 100. The fee matches the published schedule exactly for the tier and amount band. If the user changes the amount to GHS 300, the fee updates to GHS 2.50 in real time. The fee is debited at the same time as the principal (atomically) and is recorded as a separate line item in the transaction history for auditability and any future fee reversal logic.
+
+**Notes:** Fee transparency is both a regulatory requirement and a consumer trust issue. Users should never see a fee they did not see before confirming. Money math must use fixed-point or decimal arithmetic, not floating point: a fee of GHS 0.50 represented as a float can produce rounding errors that accumulate into ledger drift over millions of transactions. The cleanest implementation stores all amounts as integer minor units (pesewas in Ghana) and only converts to decimal for display.
+
 ## References
 
 This plan is informed by, but not formally compliant with, the following frameworks. Mentioned to make the regulatory awareness explicit:
@@ -893,4 +1142,4 @@ This plan is informed by, but not formally compliant with, the following framewo
 
 ---
 
-*Test cases for Flows 4 through 7 are pending and will be added incrementally.*
+*Test cases for Flows 5 through 7 are pending and will be added incrementally.*
