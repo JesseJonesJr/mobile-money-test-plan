@@ -649,12 +649,12 @@ KYC tier transaction limits, AML alert triggers, sanctions screening, transactio
 2. Agent enters user's phone number `+233 24 555 1234`
 3. Agent enters amount GHS 500
 4. Agent presses "Confirm"
-5. User receives an SMS OTP and reads it to the agent (or scans a QR code from the agent app)
-6. Agent enters the OTP and submits
+5. User's phone receives a push notification or USSD prompt: "Confirm deposit of GHS 500 from Agent KOJO ENT (#A12345). Enter your PIN to approve."
+6. User enters their PIN on their own device to authorize the transaction
 
-**Expected Result:** Transaction completes within 5 seconds. User balance updates from GHS 100 to GHS 600. Agent float updates from GHS 5,000 to GHS 4,500. Both user and agent receive a confirmation SMS with the transaction reference. The transaction is logged in both user and agent histories with status "Completed".
+**Expected Result:** Transaction completes within 5 seconds of user PIN entry. User balance updates from GHS 100 to GHS 600. Agent float updates from GHS 5,000 to GHS 4,500. Both user and agent receive a confirmation SMS with the transaction reference. The transaction is logged in both user and agent histories with status "Completed".
 
-**Notes:** The user-confirmation step (OTP or QR scan) prevents agent-side fraud where an unscrupulous agent fakes a deposit. Without this control, an agent could "deposit" to themselves and pocket the customer's cash.
+**Notes:** The user authorizes the transaction with their PIN on their own device. The agent never sees the user's PIN and the user never shares any credential with the agent. This is the standard mobile money pattern in Ghana (MTN MoMo, AirtelTigo, Telecel) and most African markets, and it is the strongest of the common agent-deposit confirmation patterns. The agent cannot fake a deposit because the money only moves if the user actively approves on their own phone. Some other markets and platforms use QR-scan or OTP-share patterns; this test plan adopts the PIN-on-user-device pattern as the reference.
 
 ### TC-CIN-002: Cash-in updates user wallet and agent float atomically
 
