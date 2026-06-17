@@ -1405,6 +1405,289 @@ The user view shows what the user paid. The agent view shows what they earned. T
 
 **Notes:** Multi-party reconciliation is essential. The user, agent, platform, and regulator each need a consistent view of the transaction at their appropriate level of detail. The cleanest implementation uses a single source of truth (the audit ledger) with role-based views derived from it. This avoids drift where "the agent's view shows GHS 2.00 commission but the audit shows GHS 2.05" can destroy trust at the agent network level. End-of-day reconciliation should cross-check that the sum of all user debits equals the sum of all agent float credits plus all commission accruals plus all platform fees, on every settlement run.
 
+## Flow 6: Cross-Border & FX
+
+12 test cases covering international transfer happy path, FX rate locking, transparent margin disclosure, sanctions screening, unsupported destinations, currency precision across destinations, KYC tier gating, independent cross-border limits, in-transit settlement tracking, FX-favorable refund on failure, enhanced AML logging at threshold, and idempotency across slow corridors.
+
+### TC-XBD-001: International transfer from Ghana to Kenya completes successfully
+
+**Category:** Functional
+**Severity:** Critical
+
+**Preconditions:**
+
+- Sender: Standard tier user in Ghana, wallet balance GHS 1,000
+- Recipient: registered M-Pesa user in Kenya, recipient number `+254 712 345 678`
+- Corridor Ghana to Kenya is supported with M-Pesa as the destination network
+- Current FX quote: 1 GHS = 12.30 KES (platform rate; mid-market 12.50, spread 1.6%)
+- Cross-border fee for the GHS 500 band: GHS 15
+
+**Steps:**
+
+1. Sender selects "Send Internationally"
+2. Selects destination country: Kenya
+3. Enters recipient phone `+254 712 345 678`
+4. Enters amount to send: GHS 500
+5. System displays the quote: send GHS 500, fee GHS 15, total deducted GHS 515. Recipient receives KES 6,150 at 1 GHS = 12.30 KES. Mid-market rate 1 GHS = 12.50 KES. Margin 1.6%. Quote valid 5 minutes.
+6. Sender confirms with PIN
+
+**Expected Result:** Sender wallet debits GHS 515. Funds route through the corridor partner. Recipient's M-Pesa Kenya wallet credits KES 6,150 within the typical corridor SLA (often 30 seconds to several minutes). Both sender and recipient receive SMS in their respective languages and currencies. Transaction is logged on both sides with a matching cross-border reference ID.
+
+### TC-XBD-002: FX rate is locked at quote time for the duration of quote validity
+
+**Category:** Money Math
+**Severity:** High
+
+**Preconditions:**
+
+- User received a quote at 14:00 (1 GHS = 12.30 KES, valid 5 minutes)
+- At 14:02, the underlying market moves: actual rate is now 1 GHS = 12.20 KES (less favorable)
+- User confirms the transfer at 14:03 (still within validity window)
+
+**Steps:**
+
+1. User confirms the transfer with PIN at 14:03
+
+**Expected Result:** Transfer settles at the LOCKED rate of 1 GHS = 12.30 KES, not the current 12.20. Recipient receives the amount calculated at the locked rate. Platform absorbs the FX risk during the validity window (either holding inventory in destination currency or having pre-hedged via the corridor partner). If the user had attempted to confirm at 14:06 (after the 5-minute window), the quote would be marked expired and a fresh quote would be required before proceeding.
+
+**Notes:** Quote locking is what separates a fair FX platform from one that bait-and-switches users. The 5-minute window is industry standard. Longer windows expose the platform to too much FX risk; shorter windows annoy users with frequent re-quoting. The platform manages this by holding small currency inventories, prearranging forward hedges with partners, or charging a margin (TC-XBD-003) wide enough to absorb expected movement.
+
+### TC-XBD-003: FX margin is disclosed transparently before user confirmation
+
+**Category:** Compliance + Money Math
+**Severity:** High
+
+**Preconditions:**
+
+- User is on the cross-border quote screen
+- Current mid-market rate from a reliable source (e.g. Reuters or central bank): 1 GHS = 12.50 KES
+- Platform's customer rate: 1 GHS = 12.30 KES
+- Spread: 1.6%
+
+**Steps:**
+
+1. User enters GHS 500 to send to Kenya
+2. System fetches the current mid-market rate and applies the platform spread
+3. Quote screen renders
+
+**Expected Result:** Quote screen displays the following, all visible by default (not hidden behind an "i" icon or expandable section):
+
+- Amount to send: GHS 500
+- Service fee: GHS 15
+- Exchange rate: 1 GHS = 12.30 KES (platform rate)
+- Mid-market rate: 1 GHS = 12.50 KES
+- FX margin: 1.6% (equivalent: GHS 0.20 per 1 GHS exchanged)
+- Recipient gets: KES 6,150
+
+The platform rate displayed in the quote is the rate that is actually applied at settlement (verified separately in TC-XBD-002). Any discrepancy between displayed rate and settled rate is a critical failure.
+
+**Notes:** Hidden FX margins are how traditional remittance providers extract value from users without their knowledge. Transparency on margin is increasingly required by regulators (especially in the EU under PSD2 and equivalent consumer protection frameworks elsewhere) and is the trust-building feature that platforms like Wise built their brand on. The test verifies BOTH the disclosure AND that the disclosed rate matches the applied rate. If those two diverge, the disclosure becomes worse than no disclosure because it actively misleads.
+
+### TC-XBD-004: Transfer to a sanctioned country or sanctioned individual is blocked
+
+**Category:** Compliance
+**Severity:** Critical
+
+**Preconditions:**
+
+- Platform sanctions screening is integrated with up-to-date OFAC, UN, EU, and UK sanctions lists
+- Scenario A: recipient country is sanctioned (e.g. North Korea, Iran depending on current list)
+- Scenario B: recipient name matches a Specially Designated National (SDN) entry on the OFAC list
+
+**Steps:**
+
+1. (Scenario A) Sender attempts to send to a recipient in a sanctioned country
+2. (Scenario B) Sender attempts to send to a recipient whose name and approximate date of birth match an SDN entry
+
+**Expected Result:** Both scenarios are blocked BEFORE any wallet debit. User sees: "We cannot process this transfer due to international sanctions regulations. Please contact support for more information." Sender wallet is not debited. A compliance alert is logged with full details: sender ID, recipient details, screening result, list source, match confidence score. Repeated attempts by the same sender are flagged for enhanced AML review.
+
+**Notes:** Sanctions screening is non-negotiable for any cross-border financial service. Violation can result in catastrophic fines and loss of correspondent banking relationships. False positives are common (many people share names with SDN entries) and should route to manual review rather than auto-block permanently, but the platform always errs on the side of blocking until human review clears the transaction.
+
+### TC-XBD-005: Transfer to an unsupported destination is rejected with a clear message
+
+**Category:** Negative
+**Severity:** Medium
+
+**Preconditions:**
+
+- Sender attempts to send to a country where the platform has no corridor partner (not sanctioned, just not yet supported)
+- Example: a country where mobile money infrastructure exists but no integration is in place
+
+**Steps:**
+
+1. Sender selects "Send Internationally"
+2. Searches for the destination country
+3. The country either does not appear in the list or appears greyed out
+
+**Expected Result:** User sees: "Sorry, we do not yet support transfers to this country. Check back soon as we add new corridors." No compliance flag is raised (this is a service gap, not a regulatory event). User can opt to be notified when the corridor becomes available.
+
+### TC-XBD-006: Currency precision is handled correctly across destination currencies
+
+**Category:** Money Math + Edge
+**Severity:** High
+
+**Preconditions:**
+
+- Sender has GHS 1,000 wallet balance
+- Destination currencies with different decimal precision:
+  - JPY (Japan): 0 decimal places (whole yen only)
+  - USD: 2 decimal places (cents)
+  - BHD (Bahrain): 3 decimal places (fils)
+
+**Steps:**
+
+1. Send GHS 100 to a JPY destination (test rate 1 GHS = 12.345 JPY)
+2. Send GHS 100 to a USD destination (test rate 1 GHS = 0.0833 USD)
+3. Send GHS 100 to a BHD destination (test rate 1 GHS = 0.031 BHD)
+
+**Expected Result:**
+
+- JPY: recipient receives 1,234 yen (rounded to whole yen per destination currency precision)
+- USD: recipient receives USD 8.33 (rounded to 2 decimal places)
+- BHD: recipient receives BHD 3.100 (rounded to 3 decimal places, trailing zero displayed)
+
+The rounding rule is consistently applied (typically banker's rounding) and is identical to the rule used in commission and fee calculations across the rest of the platform. The user is shown the destination amount in destination-currency precision BEFORE confirming.
+
+**Notes:** Currency precision is a classic FinTech gotcha. JPY has no minor units. BHD and other Gulf currencies have three decimal places. Treating all currencies as if they have two decimal places leads to either nonsensical amounts (JPY 12.34) or precision loss (BHD 3.10 instead of BHD 3.100). The platform must store amounts in the appropriate minor units per currency: 1 yen = 1 minor unit; 1 cent = 1 minor unit (USD); 1 fils = 1 minor unit (BHD).
+
+### TC-XBD-007: Cross-border transfer requires sufficient KYC tier
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- Basic tier user (lowest KYC level)
+- Cross-border policy: requires Standard tier or higher
+
+**Steps:**
+
+1. Basic tier user attempts to access "Send Internationally"
+
+**Expected Result:** Feature is either greyed out with the message "Cross-border transfers require Standard or higher KYC. Please upgrade your account to access this feature," OR an attempt to proceed is blocked at the validation step before any debit. No wallet activity occurs. User is offered the path to upgrade KYC (link to the flow tested in TC-KYC-006).
+
+**Notes:** Cross-border transfers carry higher AML and sanctions risk than domestic transfers, which is why regulators require deeper KYC. The tier-gating is a compliance control. Some jurisdictions require Standard tier (national ID verified), others require Premium tier (national ID plus proof of address plus source of funds declaration) for cross-border.
+
+### TC-XBD-008: Cross-border daily limit is enforced independently from domestic limit
+
+**Category:** Compliance + Concurrency
+**Severity:** High
+
+**Preconditions:**
+
+- Standard tier user, domestic daily limit GHS 10,000, cross-border daily limit GHS 5,000 (lower due to higher compliance scrutiny)
+- User has already sent GHS 4,500 cross-border today
+- User attempts another GHS 700 cross-border (would push to GHS 5,200, over limit)
+
+**Steps:**
+
+1. User initiates cross-border transfer of GHS 700
+
+**Expected Result:** Transfer is rejected with: "This transfer would exceed your daily cross-border limit. You can send up to GHS 500 more cross-border today." User can still send up to their full domestic limit headroom today (the limits are independent). The cross-border limit aggregation is atomic across concurrent requests (same pattern as TC-KYC-009 and TC-COUT-005).
+
+**Notes:** Independent limits per channel reflect risk-based regulatory thinking: cross-border is riskier than domestic, so its cap is lower. Some platforms instead make limits shared (one combined daily limit across both channels). Either is defensible. The test verifies whatever the configured policy is and that the aggregation is atomic.
+
+### TC-XBD-009: Cross-border transfer in "In Transit" status is tracked through settlement
+
+**Category:** Functional + Integration
+**Severity:** High
+
+**Preconditions:**
+
+- Cross-border transfer of GHS 500 to Kenya initiated and confirmed
+- Corridor partner typically settles within 2 to 5 minutes, with occasional delays up to 30 minutes
+
+**Steps:**
+
+1. User confirms transfer
+2. Sender wallet debits immediately
+3. Transfer status becomes "In Transit"
+4. Corridor partner processes asynchronously
+
+**Expected Result:**
+
+- Sender sees real-time status updates: "Initiated" then "In Transit" then "Received by partner" then "Delivered to recipient"
+- Status changes are pushed via in-app notification and SMS at key milestones (at minimum "In Transit" and "Delivered")
+- If the transfer is still "In Transit" after the SLA threshold (e.g. 30 minutes), the sender is proactively notified that the transfer is taking longer than usual and given a support contact
+- If the transfer fails at any stage, TC-XBD-010 (refund) applies
+
+**Notes:** Cross-border transfers are inherently slower than domestic and have more failure points (correspondent bank queues, time zone delays, intermediary network issues). Users need visibility into the in-flight state. The most-asked support question in remittance is "where is my money?" Proactive status updates reduce support load and rebuild trust during delays.
+
+### TC-XBD-010: Failed cross-border transfer triggers full refund with FX-favorable treatment
+
+**Category:** Money Math + Negative
+**Severity:** Critical
+
+**Preconditions:**
+
+- Cross-border transfer initiated for GHS 500 + GHS 15 fee (sender debited GHS 515)
+- FX rate at quote time: 1 GHS = 12.30 KES
+- Corridor partner returns failure after 10 minutes ("DESTINATION_WALLET_FROZEN")
+- FX rate at refund time: 1 GHS = 12.10 KES (moved against the user during the failed transfer)
+
+**Steps:**
+
+1. Platform receives the failure response from the corridor partner
+2. Refund job initiates
+
+**Expected Result:**
+
+- Sender wallet credits GHS 515 (full principal plus fee refunded)
+- The FX risk during the failed transfer window is absorbed by the platform, NOT the user
+- User receives SMS: "Your cross-border transfer to Kenya could not be completed. Funds have been returned to your wallet. Reference: TXN-XYZ. We apologize for the inconvenience."
+- Transaction history shows the original send marked "Failed" with a link to the refund transaction
+
+**Notes:** The user-favorable FX treatment on failure is the consumer-trust move. The alternative (refunding at the new, less-favorable rate) means users lose money on transfers they did not even complete, which destroys trust quickly. The platform may have to absorb the FX delta on individual failures, but at scale, partner SLAs and hedging strategies limit the impact. Some platforms only refund the GHS amount at original rate (status quo ante); others charge a small refund-processing fee. The most trust-building pattern is the full refund described here.
+
+### TC-XBD-011: Cross-border transfer above threshold triggers enhanced AML logging
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- Standard tier user
+- AML reporting threshold for cross-border (example): GHS 10,000 single transaction OR GHS 20,000 aggregate within 30 days
+- User initiates a cross-border transfer of GHS 12,000 (above single-transaction threshold)
+
+**Steps:**
+
+1. User initiates the transfer
+2. System detects amount above threshold
+3. System prompts for additional information before allowing the user to proceed: purpose of transfer, source of funds, relationship to recipient
+
+**Expected Result:**
+
+- User must complete the additional disclosure before the transaction proceeds
+- An Enhanced Due Diligence (EDD) record is created with: sender ID and KYC tier, recipient details (name, country, relationship), amount in source and destination currencies, FX rate applied, purpose of transfer, source of funds declaration, sanctions screening result, IP address, device ID, and timestamp
+- Above a higher threshold (e.g. GHS 50,000), the transfer is held for manual compliance review before settlement
+- All cross-border transfers above the reporting threshold are included in the next scheduled regulatory report to the Financial Intelligence Centre or equivalent
+
+**Notes:** AML reporting thresholds vary by jurisdiction. In Ghana, the Bank of Ghana sets thresholds in collaboration with the Financial Intelligence Centre. The test verifies that the platform collects the required information at the right thresholds and produces the report in the required format on schedule. Missing or incomplete AML reports result in regulatory penalties that can be larger than the value of the transactions themselves.
+
+### TC-XBD-012: Idempotent retry on cross-border transfer does not double-execute
+
+**Category:** Money Math + Concurrency
+**Severity:** Critical
+
+**Preconditions:**
+
+- User initiates cross-border transfer with idempotency key `idem-xbd-001`
+- Server processes successfully (sender debited, corridor partner instruction sent)
+- Network drops during response delivery
+- Client retries with the same idempotency key
+
+**Steps:**
+
+1. Original transfer is accepted server-side and the corridor instruction is sent
+2. HTTP response is lost in transit
+3. Client retries with key `idem-xbd-001`
+4. Server receives the retry
+
+**Expected Result:** Server recognizes the idempotency key and returns the cached response of the original. NO second instruction is sent to the corridor partner. Sender wallet is not debited twice. Recipient does not receive funds twice. The transaction reference returned on the retry is identical to the original. The idempotency key retention window for cross-border is extended (e.g. 72 hours) compared to domestic (24 hours) to account for slower settlement.
+
+**Notes:** Idempotency is especially important for cross-border because the cost of a duplicate is much higher than for domestic. The platform must recover funds from the corridor partner if a duplicate gets through, which often involves manual reconciliation processes and multiple business days. During recovery, the user sees twice-debited funds. The longer retention window for cross-border idempotency keys reflects that retries may legitimately happen further apart than in domestic flows.
+
 ## References
 
 This plan is informed by, but not formally compliant with, the following frameworks. Mentioned to make the regulatory awareness explicit:
@@ -1417,4 +1700,4 @@ This plan is informed by, but not formally compliant with, the following framewo
 
 ---
 
-*Test cases for Flows 6 and 7 are pending and will be added incrementally.*
+*Test cases for Flow 7 are pending and will be added in the next iteration.*
