@@ -628,6 +628,259 @@ KYC tier transaction limits, AML alert triggers, sanctions screening, transactio
 
 **Notes:** Weak PINs are a major fraud vector. Research on breached PIN datasets shows roughly 10% of users default to "1234" or "0000" if not blocked. Banning common patterns dramatically reduces guessing attacks. The phone-last-4-digits check is especially important because attackers who get the phone number get a high-probability PIN guess for free.
 
+## Flow 3: Money In
+
+12 test cases covering agent cash-in, bank-to-wallet pulls, card top-up with 3DS, atomicity across user and agent ledgers, idempotency on network retries, wallet balance ceilings, reversal windows, and immutable transaction history.
+
+### TC-CIN-001: Agent deposits a valid amount to user wallet (happy path)
+
+**Category:** Functional
+**Severity:** Critical
+
+**Preconditions:**
+
+- Agent has an active agent account with float balance of GHS 5,000
+- User is a Standard tier customer with balance GHS 100 (well below wallet ceiling)
+- Agent and user are physically present at the agent's location
+
+**Steps:**
+
+1. Agent opens the agent app and selects "Deposit"
+2. Agent enters user's phone number `+233 24 555 1234`
+3. Agent enters amount GHS 500
+4. Agent presses "Confirm"
+5. User receives an SMS OTP and reads it to the agent (or scans a QR code from the agent app)
+6. Agent enters the OTP and submits
+
+**Expected Result:** Transaction completes within 5 seconds. User balance updates from GHS 100 to GHS 600. Agent float updates from GHS 5,000 to GHS 4,500. Both user and agent receive a confirmation SMS with the transaction reference. The transaction is logged in both user and agent histories with status "Completed".
+
+**Notes:** The user-confirmation step (OTP or QR scan) prevents agent-side fraud where an unscrupulous agent fakes a deposit. Without this control, an agent could "deposit" to themselves and pocket the customer's cash.
+
+### TC-CIN-002: Cash-in updates user wallet and agent float atomically
+
+**Category:** Money Math + Concurrency
+**Severity:** Critical
+
+**Preconditions:**
+
+- Agent float balance = GHS 5,000
+- User balance = GHS 100
+- A controlled failure point is injected after the user wallet update but before the agent float update (test environment)
+
+**Steps:**
+
+1. Agent submits a GHS 500 deposit to the user
+2. System updates user balance to GHS 600
+3. System encounters the injected failure before updating agent float
+
+**Expected Result:** Both updates roll back. User balance returns to GHS 100. Agent float remains GHS 5,000. The transaction is recorded as "Failed" with a rollback reason in the audit log. No state ever exists where user got money but the agent's float was not debited (or vice versa).
+
+**Notes:** Mobile money ledgers must enforce all-or-nothing semantics across multiple account updates. Without transactional integrity (database transactions, sagas with compensating actions, or event-sourced ledgers), partial failures create money out of thin air or destroy it. This is one of the most common sources of catastrophic accounting drift in poorly-engineered FinTech systems.
+
+### TC-CIN-003: Agent cannot deposit more than their float balance
+
+**Category:** Negative
+**Severity:** High
+
+**Preconditions:**
+
+- Agent float balance = GHS 200
+- User account is active and able to receive
+
+**Steps:**
+
+1. Agent attempts to deposit GHS 500 to the user
+
+**Expected Result:** Deposit is rejected with the message "Insufficient float balance. Please top up your float before processing more deposits." User balance is unchanged. Agent float is unchanged. No transaction is recorded except a "Failed: insufficient float" entry in the agent's transaction history.
+
+**Notes:** Agent float is the agent's pre-funded liquidity. Each cash-in deducts from the float, each cash-out adds to it. Without this check, agents could "deposit" beyond their float, which means platform-side money is created without corresponding cash backing. That is effectively printing money and is the kind of failure that ends partnerships with regulators.
+
+### TC-CIN-004: User receives SMS confirmation immediately on successful deposit
+
+**Category:** Functional
+**Severity:** Medium
+
+**Preconditions:**
+
+- A successful agent deposit just completed (TC-CIN-001 passed)
+- User's registered phone has active SMS service
+
+**Steps:**
+
+1. Complete a successful deposit
+2. Wait up to 60 seconds for SMS delivery
+
+**Expected Result:** SMS arrives within 60 seconds. Message includes: transaction type (Cash-in), amount, agent name and ID, timestamp, new balance, and transaction reference number. Example: "You received GHS 500 from Agent KOJO ENT (#A12345) on 17/06/2026 at 14:32. New balance: GHS 600. Ref: TXN78451234. Was this not you? Call 100."
+
+**Notes:** Mobile money users frequently rely on SMS as their primary record of transactions. Many users transact via USSD and do not even open the app during a transaction. The SMS IS the receipt. The "was this not you" line is a critical fraud tripwire that prompts the user to act immediately if the transaction was unauthorized.
+
+### TC-CIN-005: Bank-to-wallet transfer succeeds for a valid linked bank account
+
+**Category:** Functional
+**Severity:** Critical
+
+**Preconditions:**
+
+- User has linked a bank account with valid Open Banking authorization (token not expired)
+- Linked bank account has GHS 1,000 available balance
+- User is on the "Add Money" screen and has selected "From Bank"
+
+**Steps:**
+
+1. Select the linked bank account
+2. Enter amount GHS 500
+3. Confirm
+4. Complete bank-side authentication (in-app push approval or OTP)
+
+**Expected Result:** Bank account debits GHS 500. Wallet credits GHS 500. Both sides are reconciled within 60 seconds (subject to bank settlement speed). User receives SMS and in-app notification. Transaction is logged with the source identifier (bank name, masked account number) and a separate bank transaction reference.
+
+### TC-CIN-006: Card top-up requires 3D Secure authentication for first-time card use
+
+**Category:** Security
+**Severity:** High
+
+**Preconditions:**
+
+- User is adding a new Visa or Mastercard for the first time on this platform
+- Card is enrolled in 3DS (most cards in Ghana are via GhIPSS and the issuer)
+
+**Steps:**
+
+1. Enter card number, expiry, CVV
+2. Enter top-up amount GHS 200
+3. Submit
+4. 3DS challenge page loads on the issuer's domain
+5. Complete the challenge (typically OTP sent to the bank-registered phone or biometric in the bank app)
+6. Return to the platform
+
+**Expected Result:** The 3DS challenge MUST appear before the transaction processes. If user fails 3DS or cancels, no charge is made and no credit appears in the wallet. On successful 3DS, the card is charged GHS 200 and the wallet credits GHS 200. The card is tokenized for future use, but subsequent transactions may also require 3DS depending on amount and issuer policy.
+
+**Notes:** 3DS (SCA in Europe) shifts liability for fraudulent transactions from the merchant to the issuer. Without 3DS, fraudulent card top-ups become chargebacks against the platform and can put the card-processing relationship with the acquirer at risk. Some markets allow exemptions for low-value or recurring transactions, but first-time use should always require it.
+
+### TC-CIN-007: Idempotent retry on cash-in does not double-credit the user
+
+**Category:** Money Math + Concurrency
+**Severity:** Critical
+
+**Preconditions:**
+
+- Agent float balance = GHS 5,000
+- User balance = GHS 100
+- Network conditions are unreliable (test environment simulates packet loss on response path)
+- The deposit API requires an idempotency key per request
+
+**Steps:**
+
+1. Agent submits a GHS 500 deposit with idempotency key `idem-abc-001`
+2. Server processes the deposit successfully: user balance becomes GHS 600, agent float becomes GHS 4,500
+3. The HTTP response is lost in transit (server-side success, client-side timeout)
+4. Agent's client automatically retries the same deposit with the same idempotency key `idem-abc-001`
+5. Server receives the retry
+
+**Expected Result:** Server recognizes idempotency key `idem-abc-001` as already-processed. Server returns the cached response of the original successful transaction WITHOUT re-executing the deposit. User balance remains GHS 600 (NOT GHS 1,100). Agent float remains GHS 4,500 (NOT GHS 4,000). Only ONE transaction is recorded in the audit log. Both the original response and the retry response refer to the same transaction reference number.
+
+**Notes:** This is the most operationally important test in the entire cash-in flow. Network drops are routine in mobile data conditions, especially in markets where users rely on 3G/4G with weak signal. Without idempotency, the natural client behavior of "retry on timeout" creates duplicate transactions. The user gets credited twice and the agent's float depletes twice for one cash payment. Multiplied across millions of transactions per day, this is how platforms lose serious money to operational drift. Industry standard: idempotency keys with at least 24-hour retention, returning the original response (status code and body) on retry. The Stripe API is the public reference implementation of this pattern.
+
+### TC-CIN-008: Deposit is blocked when wallet would exceed tier balance ceiling
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- User is Basic tier
+- Basic tier wallet balance ceiling = GHS 10,000 (distinct from per-transaction or daily/monthly transaction limits)
+- User current balance = GHS 9,500
+- Agent has sufficient float
+
+**Steps:**
+
+1. Agent attempts to deposit GHS 800 (would bring balance to GHS 10,300, above ceiling)
+
+**Expected Result:** Deposit is rejected with the message "This deposit would exceed the recipient's wallet balance limit. The customer can receive up to GHS 500 more, or should upgrade to Standard tier for a higher limit." Agent float is not debited. No partial deposit is made. The user can still receive deposits up to the available headroom (GHS 500 in this case).
+
+**Notes:** Wallet balance ceilings exist separately from transaction limits and are a regulatory compliance feature. They limit the amount of money mobile money operators hold for any one customer at any one time, both to limit consumer exposure and to manage the operator's prudential reserve requirements with the central bank.
+
+### TC-CIN-009: Agent can reverse a deposit within the 15-minute correction window
+
+**Category:** Functional
+**Severity:** High
+
+**Preconditions:**
+
+- Agent completed a GHS 500 deposit to user 3 minutes ago
+- Reversal window policy: agent can self-initiate reversal within 15 minutes of the original transaction, conditional on the recipient not having spent the funds
+- User has not initiated any transaction since the deposit
+
+**Steps:**
+
+1. Agent opens the transaction history
+2. Selects the recent deposit
+3. Taps "Reverse"
+4. Confirms the reversal by entering agent PIN
+
+**Expected Result:** Reversal completes immediately. User balance decreases by GHS 500. Agent float increases by GHS 500. Both parties receive SMS notification of the reversal. The original transaction is marked "Reversed" with a link to the reversal transaction. The reversal itself cannot be reversed. If the user had spent any portion of the deposit, the reversal is blocked with the message "Cannot reverse: funds have been used. Escalate to support."
+
+### TC-CIN-010: Reversal beyond the 15-minute window requires recipient consent
+
+**Category:** Security
+**Severity:** High
+
+**Preconditions:**
+
+- Agent completed a GHS 500 deposit to user 30 minutes ago
+- The 15-minute reversal window has elapsed
+- User still has the funds available (not spent)
+
+**Steps:**
+
+1. Agent initiates reversal via the support escalation flow
+2. System sends a consent request to the recipient: "Agent KOJO ENT is requesting to reverse a GHS 500 deposit made at 14:32. Approve / Deny?"
+3. User responds via app or SMS reply
+
+**Expected Result:** Reversal does NOT proceed without user consent. If user approves, reversal executes (same flow as TC-CIN-009). If user denies, reversal is blocked and a support ticket is created for manual review. If user does not respond within 24 hours, the request expires and the reversal must be processed manually through support with documented justification.
+
+**Notes:** This control prevents abusive reversal by agents. Without consent, an agent could effectively cash someone out indirectly by depositing then reversing after the user has already spent money in reliance on the deposit. The consent step puts the user in control of their wallet state.
+
+### TC-CIN-011: Bank deposit failure does not partial-credit the wallet
+
+**Category:** Money Math + Negative
+**Severity:** Critical
+
+**Preconditions:**
+
+- User's linked bank account has only GHS 100 available
+- User attempts to deposit GHS 500 from the bank
+
+**Steps:**
+
+1. Initiate bank-to-wallet transfer of GHS 500
+2. Authenticate with the bank
+3. Bank API returns "INSUFFICIENT_FUNDS" response
+
+**Expected Result:** Wallet balance is unchanged (no partial credit of GHS 100). Bank account balance is unchanged (no partial debit). User sees a clear error: "Your bank reported insufficient funds. Please check your account balance and try again." The failed transaction is logged but does not appear in normal transaction history (or is clearly marked "Failed - Not Processed").
+
+**Notes:** Partial credit is the classic mobile money money-math failure. If the platform credits whatever portion the bank approved but logs the user-requested amount, the ledger is corrupted. If the platform debits the bank but the wallet credit fails, money disappears. The cleanest pattern is: bank either authorizes the full amount or nothing at all, and the wallet credit happens AFTER successful bank debit confirmation.
+
+### TC-CIN-012: Deposit transaction is recorded immutably with full audit details
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- A successful deposit just completed (any channel: agent, bank, or card)
+
+**Steps:**
+
+1. Open the user's transaction history
+2. Find the deposit transaction
+3. Open the transaction detail view
+
+**Expected Result:** Transaction record displays: transaction ID (system-generated unique reference), channel (Cash-in via agent / Bank transfer / Card top-up), amount and currency, source identifier (agent ID and name, or bank name and masked account, or card last 4), timestamp in both UTC and the user's local timezone, status "Completed", balance before and balance after, and a cryptographic hash linking this transaction to the previous one in the ledger (tamper-evidence). The record cannot be edited or deleted by any user role including platform admins. Only annotations can be added (e.g. "Customer disputed, reviewed and confirmed valid"). Any modification attempt is logged separately as an audit event.
+
+**Notes:** Immutability is required by AML regulations and is essential for dispute resolution. Many jurisdictions require transaction records to be retained for 5 to 7 years. Hash-chained or append-only logs (similar in concept to blockchain or write-once storage) make tampering detectable even by privileged insiders.
+
 ## References
 
 This plan is informed by, but not formally compliant with, the following frameworks. Mentioned to make the regulatory awareness explicit:
@@ -640,4 +893,4 @@ This plan is informed by, but not formally compliant with, the following framewo
 
 ---
 
-*Test cases for Flows 3 through 7 are pending and will be added incrementally.*
+*Test cases for Flows 4 through 7 are pending and will be added incrementally.*
