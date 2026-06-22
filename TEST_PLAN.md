@@ -1688,6 +1688,337 @@ The rounding rule is consistently applied (typically banker's rounding) and is i
 
 **Notes:** Idempotency is especially important for cross-border because the cost of a duplicate is much higher than for domestic. The platform must recover funds from the corridor partner if a duplicate gets through, which often involves manual reconciliation processes and multiple business days. During recovery, the user sees twice-debited funds. The longer retention window for cross-border idempotency keys reflects that retries may legitimately happen further apart than in domestic flows.
 
+## Flow 7: Compliance, Limits & Audit
+
+12 test cases covering tamper-evident transaction ledgers, daily e-money reconciliation, AML structuring detection, SAR generation, account freezes (full and selective), PEP screening, CTR threshold reporting, data subject access requests, retention-aware deletion, balance reconstruction from ledger, and scheduled regulatory reporting.
+
+### TC-COMP-001: Transaction ledger is hash-chained for tamper evidence
+
+**Category:** Compliance + Security
+**Severity:** Critical
+
+**Preconditions:**
+
+- Platform maintains an append-only ledger of all transactions across all wallets
+- Each ledger entry includes: the transaction details, a SHA-256 hash of (previous entry's hash concatenated with this entry's content), and a platform-signed timestamp
+- A historical transaction exists in the ledger from 30 days ago
+
+**Steps:**
+
+1. Inspect the ledger entry from 30 days ago
+2. Modify the amount field in the database directly, bypassing the application layer (simulating an insider attack with database access)
+3. Run the ledger verification job
+
+**Expected Result:** The verification job detects the tampering immediately:
+
+- The hash of the modified entry no longer matches the chain
+- All subsequent entries' hashes become invalid because they were computed from the original hash
+- The job reports the exact transaction ID where the chain broke and the timestamp of the modification
+- The platform enters a compliance-incident state: compliance team is alerted, a regulator-grade incident report is generated, and the integrity violation is investigated. Transactions are NOT paused (operational halt would harm users; the issue is forensic, not operational).
+
+**Notes:** Hash-chained ledgers are the standard approach to tamper-evident audit logs in regulated systems. The concept is similar to how a blockchain enforces immutability but private and append-only rather than public and consensus-based. The chain does NOT prevent tampering: anyone with database access can modify a row. What it does is make tampering detectable, which is the actual regulatory and forensic requirement. Pair this with off-site replicated ledger storage (so a modification to the primary cannot be silently replicated to the off-site copy without re-doing all subsequent hashes) for full subpoena-proof audit trails. Regulators in mature financial markets increasingly request the verification report as part of their audits.
+
+### TC-COMP-002: Daily reconciliation verifies the e-money conservation invariant
+
+**Category:** Compliance + Money Math
+**Severity:** Critical
+
+**Preconditions:**
+
+- End-of-day reconciliation job is scheduled for 23:59 daily
+- Total e-money issued (matched by the trust account balance at the central bank): GHS 100,000,000
+- All wallet balances, agent floats, commission wallets, escrows, and platform fee revenue accounts have current balances
+
+**Steps:**
+
+1. Reconciliation job runs at 23:59
+2. Job sums all in-circulation balances across all account types
+
+**Expected Result:** The sum equals the total e-money issued, to the pesewa (last minor unit):
+
+Sum(customer wallet balances) + Sum(agent e-money float) + Sum(agent commission wallets, accrued plus settled) + Sum(escrow holdings) + Sum(platform fee revenue accumulated) + Sum(in-transit cross-border) = GHS 100,000,000.00
+
+If the sum does not match (even by GHS 0.01), the platform enters reconciliation-break state:
+
+- Transactions are NOT halted (operational decision: better to keep service running while investigating than halt for what is usually a fee-rounding bug)
+- All new transactions in this state are tagged for retrospective review
+- Compliance and engineering are alerted with the exact discrepancy amount
+- Investigation must identify the source within 24 hours, typically a fee calculation rounding bug, a missed atomic update, or an unhandled error path
+
+**Notes:** This is the fundamental invariant of any closed-loop money system: money is conserved. Discrepancies of GHS 0.01 from rounding bugs become GHS 1,000 after a million transactions and become regulatory incidents. Daily reconciliation catches drift early. Mobile money operators in Ghana are required to maintain trust account balances at the central bank equal to all outstanding e-money. Reconciliation failure is a reportable event to the Bank of Ghana.
+
+### TC-COMP-003: Structuring pattern triggers an AML alert
+
+**Category:** Compliance + Security
+**Severity:** Critical
+
+**Preconditions:**
+
+- AML rule engine is configured with a "structuring" rule: more than 3 transactions from the same sender to the same recipient on the same day, each below the GHS 10,000 single-transaction reporting threshold, but totaling above it
+- User sends:
+  - 09:00: GHS 9,500 to recipient R
+  - 11:30: GHS 9,000 to recipient R
+  - 14:00: GHS 8,500 to recipient R
+  - 16:00: attempts to send GHS 9,000 to recipient R (total today would be GHS 36,000)
+
+**Steps:**
+
+1. Each individual transaction is below the GHS 10,000 single-transaction threshold and processes initially
+2. AML rule engine evaluates the pattern as each new transaction comes in
+3. The 4th transaction triggers the rule
+
+**Expected Result:** The 4th transaction is held in a "Pending AML review" state. Sender sees: "Your transaction is being reviewed for compliance. Reference: TXN-XYZ." Compliance team receives an alert with the full pattern: all 4 transactions, sender KYC details, recipient KYC details, total day-aggregate, and the specific rule that fired. Compliance investigates within the SLA (typically 24 hours) and either approves the transaction or escalates to a SAR (TC-COMP-004).
+
+**Notes:** Structuring (also called "smurfing") is one of the most common money laundering tactics. The rule must look at patterns, not just individual transactions. Modern AML systems combine deterministic rules like this with ML-based behavioral analysis, but a clear deterministic rule is the floor. Even if the user is doing this innocently (paying installments to a contractor, for example), the platform must still flag it because the regulator requires evidence that the system catches the pattern. The compliance team's job is then to determine intent and act accordingly.
+
+### TC-COMP-004: Suspicious Activity Report (SAR) is generated for confirmed AML cases
+
+**Category:** Compliance
+**Severity:** Critical
+
+**Preconditions:**
+
+- A compliance investigation (from TC-COMP-003 or similar trigger) has concluded that the activity is suspicious
+- Compliance officer marks the case as "SAR-required"
+
+**Steps:**
+
+1. Compliance officer triggers SAR generation
+2. System compiles all relevant data
+3. SAR is generated in the format required by the Financial Intelligence Centre
+
+**Expected Result:** SAR document is produced with all required fields:
+
+- Sender full KYC details (name, ID number, address, phone, account history)
+- Recipient details (full KYC if on-platform, available details if off-platform)
+- Transaction details (amounts, dates, channels, references)
+- Suspicious pattern description (what triggered the review)
+- Compliance officer's narrative explaining why the activity is suspicious
+- Supporting evidence (transaction history, communications if any)
+- Reporting timestamps and case ID
+
+SAR is filed with the Financial Intelligence Centre within the regulatory deadline (typically 24 to 72 hours of confirmation, depending on jurisdiction). User is NOT notified that a SAR has been filed (anti-tipping-off rules: notifying the subject of an investigation is itself a criminal offense in most jurisdictions). The subject's account may continue normally, may be frozen, or may be subject to additional monitoring depending on the case.
+
+**Notes:** SAR filing is sensitive. False positives waste regulator time and damage user relationships if leaked. False negatives expose the platform to severe penalties. The "tipping off" rule is counter-intuitive: even if an account is frozen pending a SAR, the platform legally cannot tell the user it is because of a SAR. This is why frozen accounts often receive generic "for security reasons" messages rather than explanations.
+
+### TC-COMP-005: Frozen account cannot send, receive, or withdraw
+
+**Category:** Compliance + Security
+**Severity:** Critical
+
+**Preconditions:**
+
+- User account is in `frozen` state, set by the compliance team after an AML investigation
+- User has wallet balance of GHS 500
+
+**Steps:**
+
+1. User attempts to log in
+2. User attempts to send money to another user
+3. Another user attempts to send money TO the frozen user
+4. Agent attempts to deposit cash to the frozen user
+5. User attempts to withdraw to bank
+
+**Expected Result:**
+
+- Login: succeeds, with a banner "Your account is currently restricted. Please contact support."
+- Send: blocked. User sees: "We cannot process this transaction. Please contact support."
+- Receive (from another user): blocked. Sender sees: "This recipient cannot receive transactions at this time. Please contact support." Sender's wallet is not debited.
+- Cash deposit (from agent): blocked. Agent sees: "Cannot deposit to this account at this time. Please advise the customer to contact support."
+- Withdraw: blocked.
+
+The frozen state preserves the wallet balance (no funds are removed or moved). When the freeze is lifted, all functionality resumes. The freeze action, reason code, freeze timestamp, and authorizing officer are recorded in the immutable audit log (TC-COMP-001).
+
+**Notes:** Account freezes happen for many reasons: AML review (TC-COMP-003 and 004), court order (TC-COMP-006), suspected account takeover (TC-AUTH-007), or user-requested freeze. The "send TO" blocking is critical because senders to a frozen account may be unwitting accomplices in the suspected activity. The platform protects both the frozen account holder (no further losses if compromised) and incoming senders (no inadvertent participation in money laundering).
+
+### TC-COMP-006: Court-ordered selective freeze restricts only specified funds
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- Court order received specifying: freeze GHS 5,000 of user's funds related to a specific dispute, allow normal operation otherwise
+- User's wallet balance: GHS 8,000
+
+**Steps:**
+
+1. Compliance team applies the selective freeze: GHS 5,000 reserved, GHS 3,000 available
+2. User attempts to send GHS 2,500
+3. User attempts to send GHS 4,000
+
+**Expected Result:**
+
+- Send GHS 2,500: succeeds (within the GHS 3,000 available)
+- Send GHS 4,000: blocked. User sees: "Insufficient available balance. Available: GHS 500." User is NOT told about the court order specifically
+- Wallet balance display shows GHS 3,500 "available" and GHS 5,000 "on hold"
+- The court order, case reference, freeze amount, and authorizing officer are recorded in the audit log
+
+**Notes:** Selective freezes are more common than full freezes in regulated systems. They allow normal operation while preserving funds tied to a specific legal matter. The "available" versus "on hold" balance display is a critical UX element. When the court order is resolved (released or applied to the dispute), the funds are either restored to available or transferred per the court's instruction, with full audit entries on both sides of the resolution.
+
+### TC-COMP-007: PEP screening is performed at KYC and continuously
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- Platform PEP screening service is integrated with up-to-date PEP databases (e.g. World-Check, Dow Jones Risk and Compliance, or similar)
+- Scenario A: user A's name matches a known PEP at KYC time
+- Scenario B: user B passed KYC clean, but is named in an updated PEP database 6 months later (e.g. elected to political office)
+
+**Steps:**
+
+1. (Scenario A) User A attempts to upgrade to Standard KYC, name matches a PEP entry
+2. (Scenario B) Periodic re-screening job runs and detects user B's new PEP status
+
+**Expected Result:**
+
+- Scenario A: KYC upgrade is held for Enhanced Due Diligence (EDD). Tier upgrade does not happen automatically. Compliance reviews and applies controls: typically tier upgrade is approved, account is tagged as PEP, transaction monitoring is heightened, source-of-funds documentation is required for transactions above lower thresholds.
+- Scenario B: User's profile is updated to reflect PEP status. Existing transactions are NOT reversed. Future transactions trigger enhanced monitoring. User is notified that "additional information may be required for certain transactions" without specifying PEP status (anti-tipping-off again).
+- All PEP determinations, evidence (match score, list source, date), and applied controls are logged in the audit trail.
+
+**Notes:** PEP (Politically Exposed Person) screening is a regulatory requirement under AML frameworks worldwide. PEPs include heads of state, senior politicians, judges, military officers, and their close family members and associates. Being a PEP is not illegal: it just requires enhanced monitoring due to elevated corruption risk. False positives are common (many names match) and require manual review. Continuous re-screening catches users who BECOME PEPs after registration, which regulators increasingly require.
+
+### TC-COMP-008: Currency Transaction Report (CTR) is generated for transactions above threshold
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- CTR reporting threshold (example): GHS 10,000 single transaction OR GHS 20,000 aggregate per user per day
+- User completes a single transaction of GHS 15,000 (above single-transaction threshold)
+
+**Steps:**
+
+1. Transaction completes successfully
+2. CTR generation job runs (typically end-of-day or real-time)
+
+**Expected Result:** A CTR record is created automatically for the transaction, including all required fields: sender full KYC, recipient details, transaction amount, channel, date, time, currency, source of funds declaration (collected at transaction time per TC-XBD-011 or domestic equivalent), and an account history summary.
+
+CTRs are batched and submitted to the Financial Intelligence Centre on the regulatory schedule (typically daily or weekly). User is NOT notified about CTR filing. CTR is routine reporting, not an investigation, but still subject to anti-tipping-off practice.
+
+**Notes:** CTR is distinct from SAR. CTR is routine reporting of all large transactions; SAR is reporting of suspicious activity. Both are required, with different thresholds and timelines. CTR thresholds in Ghana, the US, the EU, and most major markets are roughly USD 10,000 equivalent or local equivalent, though the exact figure varies. Missing or late CTRs are typically penalized with per-violation fines.
+
+### TC-COMP-009: User data export request returns complete and accurate data
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- User has been on the platform for 14 months
+- User submits a data subject access request (DSAR) via privacy settings or support
+- User's account has: profile data, KYC documents, 87 transactions, session logs, device history, marketing preferences
+
+**Steps:**
+
+1. User requests data export
+2. System verifies user identity with additional verification beyond standard login (e.g. selfie match)
+3. System assembles the data export
+4. Data is delivered via secure download link with expiry
+
+**Expected Result:** Data export is delivered within the regulatory timeline (typically up to 30 days, often much faster for digital systems). Export INCLUDES:
+
+- All profile data (name, phone, KYC tier, dates, addresses on file)
+- All KYC documents (photos of submitted IDs, selfies)
+- Complete transaction history with all 87 transactions in full detail
+- Session and device history (logins, devices, IPs, dates)
+- Marketing communication preferences and history
+
+Export EXCLUDES:
+
+- Internal fraud risk scores
+- AML investigation files (protected by anti-tipping-off rules)
+- Information about other users (recipient details masked beyond what the user already saw in their own transaction history)
+- Internal employee notes about the account
+
+Export format is machine-readable (JSON or CSV) for portability per data portability provisions.
+
+**Notes:** DSAR is a right under GDPR, CCPA, Ghana's Data Protection Act, and most modern privacy frameworks. The platform must respond to verified requests within the legally mandated timeline. Identity verification is critical: a data export sent to the wrong person is a data breach. The exclusions are also critical: revealing AML investigation status would violate tipping-off rules; revealing other users' data would violate their privacy. The line between "user's own data" and "platform's internal assessment of user" is the most contested edge.
+
+### TC-COMP-010: Account deletion request honors retention requirements
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- User submits an account deletion request
+- Regulatory retention requirement (Ghana): transaction records must be retained for 5 years after the last transaction or account closure (whichever is later)
+- User has wallet balance of GHS 100 and recent transactions
+
+**Steps:**
+
+1. User requests account deletion
+2. System checks for: zero balance, no pending transactions, no active investigations, no active disputes
+3. If conditions are met, system processes deletion
+
+**Expected Result:**
+
+- If wallet balance is non-zero, user must first withdraw or transfer it. Deletion does not proceed with funds in the account.
+- If pending transactions exist, user must wait for them to settle.
+- Once preconditions are met, account moves to `deleted` state:
+  - User can no longer log in
+  - Profile data is anonymized in production systems
+  - KYC documents are retained for the regulatory minimum period in a restricted-access archive
+  - Transaction records are retained for the regulatory minimum period, accessible only to compliance and audit functions
+  - Marketing and non-essential data is permanently deleted
+
+After the 5-year retention period elapses, all retained data is permanently deleted on schedule.
+
+**Notes:** "Right to be forgotten" under GDPR and similar frameworks is NOT absolute for regulated financial services. Regulatory retention obligations override the deletion right. The platform must clearly communicate this to users at deletion time: "Your account will be closed and your personal data anonymized within 30 days. Transaction records will be retained for 5 years to meet legal requirements, then permanently deleted." The retention archive must be access-controlled separately from production systems: ordinary employees cannot search deleted user records; only compliance and audit can, with logged access.
+
+### TC-COMP-011: Wallet balance can be reconstructed from the transaction ledger at any timestamp
+
+**Category:** Compliance + Money Math
+**Severity:** High
+
+**Preconditions:**
+
+- A user wallet has 250 transactions over 18 months
+- A specific timestamp T is selected (3 months ago)
+- The expected balance at time T from the periodic snapshot is GHS 1,234.56
+
+**Steps:**
+
+1. Query the wallet's transaction ledger
+2. Replay all transactions in order from account opening up to timestamp T
+3. Compute the cumulative balance at T
+
+**Expected Result:** Reconstructed balance equals GHS 1,234.56 to the pesewa, matching the snapshot. The reconstruction works at any timestamp, not just snapshot timestamps. Any failure to reconstruct accurately indicates a ledger entry error, a balance snapshot bug, or an inconsistency that requires investigation.
+
+**Notes:** Balance reconstruction is the test that proves the ledger is the source of truth. In well-designed systems, balance is NOT stored independently of the ledger: it is derived from the ledger. This eliminates "the ledger says one thing but the balance display says another" bugs at the architectural level. For performance, snapshots are taken periodically and reconstruction starts from the nearest snapshot, but the principle is the same. Regulators in audit may request balance reconstructions for any user at any point in time as part of dispute resolution.
+
+### TC-COMP-012: Regulatory reports are generated in the required format on schedule
+
+**Category:** Compliance
+**Severity:** High
+
+**Preconditions:**
+
+- Bank of Ghana requires monthly mobile money operator returns in a specified XML format
+- Financial Intelligence Centre requires daily SAR and CTR submissions in a specified format
+- Reports include: transaction volumes, transaction values, unique active users, agent network statistics, AML case statistics, and reconciliation status
+
+**Steps:**
+
+1. End of reporting period (end of month for Bank of Ghana, end of day for FIC)
+2. Reporting jobs run automatically
+3. Reports are generated, validated against the required schema, and submitted via the regulator's portal or secure file transfer
+
+**Expected Result:**
+
+- Reports are generated within the configured window after the period ends (e.g. by 06:00 the next day for daily reports)
+- Generated files validate against the regulator's published schema (XSD for XML, JSON Schema for JSON formats)
+- Files are submitted via the regulator's required transport (often SFTP, sometimes a portal upload, sometimes an API)
+- A confirmation receipt from the regulator is captured and stored
+- The platform retains both the submitted files and the regulator receipts for the retention period (typically 5 to 10 years)
+- If submission fails, the platform alerts the compliance team within 30 minutes of expected submission time so manual escalation can begin
+
+**Notes:** Regulatory reporting is where the rubber meets the road. A platform can have perfect internal controls, but if the reports do not reach the regulator on time and in the correct format, the platform is non-compliant. Format and frequency vary by regulator and jurisdiction. Schema validation before submission catches most errors early. The retained files plus regulator receipts form the proof-of-compliance trail used in any future audit.
+
 ## References
 
 This plan is informed by, but not formally compliant with, the following frameworks. Mentioned to make the regulatory awareness explicit:
@@ -1700,4 +2031,4 @@ This plan is informed by, but not formally compliant with, the following framewo
 
 ---
 
-*Test cases for Flow 7 are pending and will be added in the next iteration.*
+*This test plan covers all seven flows defined in the Flow Index, totaling 84 test cases across functional, negative, security, compliance, concurrency, money math, edge, and integration categories.*
